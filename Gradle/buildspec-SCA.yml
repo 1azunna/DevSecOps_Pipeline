@@ -1,0 +1,92 @@
+# This Buildspec contains security testing activities from source code analysis to infrastructure security testing.
+# Created and maintained by @1azunna
+
+version: 0.2
+
+env: 
+  variables:
+    AWS_REGION: "Your AWS Region"
+    SNS_ARN: "Your SNS Topic ARN"
+    SONAR_URL: "Sonarqube host url"
+    PROJECT_NAME: "Project name"
+  parameter-store:
+    TOKEN: "Path to sonarqube API key"
+          
+phases:
+  install:
+    runtime-versions:
+      android: 29 #API Level
+      java: corretto8 #corretto8 or corretto11
+      python: 3.8
+    commands: 
+      - pip install truffleHog
+
+  pre_build:
+    commands:
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - aws s3 cp s3://security-tools/trufflehog/exclude.txt ~ --region=$AWS_REGION
+      - trufflehog file://$CODEBUILD_SRC_DIR --regex --exclude_paths ~/exclude.txt --since_commit $COMMIT_HASH
+      #or 
+      # - trufflehog file://$CODEBUILD_SRC_DIR --regex --exclude_paths ~/exclude.txt --max_depth 1
+      # - aws s3 cp s3://carbon-security-reports/trufflehog/exclude.txt . --region=$AWSREGION 
+      # - docker run --rm -v ./exclude.txt:/proj dxa4481/trufflehog https://azunna@bitbucket.org/kvpafrica/card-service.git --regex --exclude_paths exclude.txt --since_commit $COMMIT_HASH --json > trufflescan.json || true
+
+  build:
+    commands:
+      - ./gradlew sonarqube -Dsonar.host.url=$SONAR_URL -Dsonar.login=$TOKEN -Dsonar.projectKey=$PROJECT_NAME
+     
+  post_build:
+    commands:
+      - echo Entered the post_build phase...
+        #Get Sonarqube status
+      - sonar_projectname=$(curl -u "$TOKEN:" $SONAR_URL/api/ce/component\?component=$PROJECT_NAME | jq -r '.current.componentName')
+      - echo $sonar_projectname
+      - sonar_task_id=$(curl -u "$TOKEN:" $SONAR_URL/api/ce/component\?component=$sonar_projectname | jq -r '.current.id')
+      - echo $sonar_task_id
+      - | # Allow time for SonarQube Background Task to complete
+            stat="PENDING";
+            while [ "$stat" != "SUCCESS" ]; do
+              if [ $stat = "FAILED" ] || [ $stat = "CANCELLED" ]; then
+                echo "SonarQube task $sonar_task_id failed";
+                exit 1;
+              fi
+              stat=$(curl -u "$TOKEN:" $SONAR_URL/api/ce/task\?id=$sonar_task_id | jq -r '.task.status');
+              echo "SonarQube analysis status is $stat";
+              sleep 5;
+            done
+      
+      - echo Build completed on `date`
+      # Fetch Analysis results
+      - sonar_link=$SONAR_URL/dashboard?id=$PROJECT_NAME
+      - sonar_analysis_id=$(curl -u "$TOKEN:" $SONAR_URL/api/ce/task\?id=$sonar_task_id | jq -r '.task.analysisId')
+      - quality_status=$(curl -u "$TOKEN:" $SONAR_URL/api/qualitygates/project_status\?analysisId=$sonar_analysis_id | jq -r '.projectStatus.status')
+      - |
+            if [ $quality_status = "ERROR" ]; then
+              content=$(echo "SonarQube analysis complete for $PROJECT_NAME, Quality Gate Failed. To see why, $sonar_link");
+            elif [ $quality_status = "OK" ]; then
+              content=$(echo "SonarQube analysis complete for $PROJECT_NAME, Quality Gate Passed. For details, $sonar_link");
+            else
+              content="An unexpected error occurred while attempting to analyze $PROJECT_NAME with SonarQube.";
+            fi
+      
+      # Publish Sonarqube results to security channel
+      - aws sns publish --topic-arn "$SNS_ARN" --message "$content" --region $AWS_REGION > message.txt
+reports:
+  report-group-name-or-arn:
+    files:
+      - location
+      - location
+    base-directory: location
+    discard-paths: no | yes
+    file-format: report-format
+artifacts:
+  files:
+    - location
+    - location
+  name: artifact-name
+  discard-paths: no | yes
+  base-directory: location
+cache:
+  paths:
+    - path
+    - path

@@ -1,0 +1,73 @@
+# This Buildspec contains security testing activities from source code analysis to infrastructure security testing.
+# Created and maintained by @1azunna
+# Image type is Amazon Linux 2 Standard 3.0
+
+version: 0.2
+
+env: 
+  variables:
+    AWS_REGION: "Your AWS Region"
+    S3_BUCKET: "Project-Report-Bucket"
+    SNS_ARN: "Your SNS Topic ARN"
+    PROJECT_NAME: "Project name"
+    VERSION: "Version"
+    DTRACK_URL: "Dependency track URL"
+  parameter-store:
+    DTRACK_KEY: "Path to Dependency track API key on Parameter Store"
+
+phases:
+  install:
+    runtime-versions:
+      android: 29
+      java: corretto8
+
+  pre_build:
+    commands:
+       # Process Bill of Materials (BOM) 
+      - ./gradlew cyclonedxBom
+   
+  build:
+    commands:
+      - echo BOM Upload started on `date`
+      - | # Upload BOM to Dependency track
+        curl -X "POST" --url "$DTRACK_URL/api/v1/bom" -H "Content-Type:multipart/form-data" \
+        -H "X-Api-Key:$DTRACK_KEY" \
+        -F "autoCreate=true" \
+        -F "projectName=$PROJECT_NAME" \
+        -F "projectVersion=$VERSION" \
+        -F "bom=@build/reports/bom.xml;encoder=base64"
+      # Obtain project UUID
+      - UUID=$(curl -X "GET" --url "$DTRACK_URL/api/v1/project/lookup?name=$PROJECT_NAME&version=$VERSION" -H "X-Api-Key:$DTRACK_KEY" | jq -r ".uuid")
+      # Fetch Findings and Vulnerability Reports
+      # Dependency List
+      - curl -X "GET" --url "$DTRACK_URL/api/v1/dependency/project/$UUID" -H "X-Api-Key:$DTRACK_KEY" -o build/reports/dependencies.json
+      # Findings report in FPF format
+      - curl -X "GET" --url "$DTRACK_URL/api/v1/finding/project/$UUID/export" -H "X-Api-Key:$DTRACK_KEY" -o build/reports/findings-FPF.json
+      # Vulnerability report
+      - curl -X "GET" --url "$DTRACK_URL/api/v1/vulnerability/project/$UUID" -H "X-Api-Key:$DTRACK_KEY" -o build/reports/vulnerabilities.json
+    
+  post_build:
+    commands: 
+      # Zip Reports
+      - echo "Zipping reports..."
+      - cd build/reports/
+      - zip -r $PROJECT_NAME-$VERSION-$(date +%Y-%m-%d).zip .
+      # Copy reports to s3 bucket
+      - aws s3 cp $PROJECT_NAME-$VERSION-$(date +%Y-%m-%d).zip s3://${S3_BUCKET}/   
+      # You can also publish an SNS topic to notify you when a BOM has been uploaded and analysed.   
+      - aws sns publish --topic-arn "$SNS_ARN" --region $AWS_REGION --message "BOM has been successfully uploaded and analysed. You can view the reports in the s3 bucket:<S3_bucket_URL>"
+      # You could set a quality gate to fail the build if projects have a high risk score or any CRITICAL and multiple HIGH Vulnerability dependencies.
+      - echo "Checking $PROJECT_NAME against security benchmarks"
+      - RISK_SCORE=$(curl -X "GET" --url "$DTRACK_URL/api/v1/project/lookup?name=$PROJECT_NAME&version=$VERSION" -H "X-Api-Key:$DTRACK_KEY" | jq ".lastInheritedRiskScore")
+      - CRITICAL=$(cat findings-FPF.json | jq -r '.findings[] | select(.vulnerability.severity == "CRITICAL") | .vulnerability.severity' | wc -l)
+      - HIGH=$(cat findings-FPF.json | jq -r '.findings[] | select(.vulnerability.severity == "HIGH") | .vulnerability.severity' | wc -l)
+      - |
+            if [ "$RISK_SCORE" -gt "10" ] || [ "$CRITICAL" -gt "0" ] || [ "$HIGH" -gt "3" ]; then
+                echo "The project did not meet the security benchmarks"
+                exit 1
+              elif [ "$RISK_SCORE" -le "10" ] ; then
+                echo "The project passed the security benchmarks"
+              else
+                echo "An error occured while checking security benchmarks"
+            fi
+      - echo Done.
